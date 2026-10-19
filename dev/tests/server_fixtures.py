@@ -780,6 +780,8 @@ def main_args(**overrides):
             "model_root": "model",
             "tokenizer": "tokenizer",
             "model": "test-model",
+            "jit_model": [],
+            "model_ttl": serve_options.DEFAULT_MODEL_TTL,
             "served_model_name": [],
             "announce_served_name": False,
             "default_reasoning_effort": None,

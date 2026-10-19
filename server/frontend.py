@@ -255,13 +255,16 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
+        latencies=None,
+        response_store=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
         # Announced by the engine in its Ready event. Without it, message
         # normalization rejects image and PDF input before any decoding.
         self.vision = vision
-        self.latencies = LatencyMetrics()
+        # Several models' frontends share the server's (JIT mode).
+        self.latencies = LatencyMetrics() if latencies is None else latencies
         self.tokenizer = tokenizer
         # Probed at startup; requests choose among these, never the
         # tokenizer's own.
@@ -304,7 +307,9 @@ class Frontend:
         self.preparation_lock = threading.Lock()
         self.preparation_active = 0
         self.preparation_waiting = 0
-        self.response_store = ResponseStore()
+        self.response_store = (
+            ResponseStore() if response_store is None else response_store
+        )
         self.thinking_codec = thinking_codec
 
     def accepts_model(self, model):
