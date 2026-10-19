@@ -82,7 +82,8 @@ access.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
+| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. Repeat it to serve several models in [JIT mode](#several-models-jit-mode). See [upstream model loading](#upstream-model-loading). |
+| `--all-models` | Off | Also serve every installed model, in [JIT mode](#several-models-jit-mode); `--model` is then optional. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
@@ -98,6 +99,7 @@ access.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
+| `--model-ttl` | `5m` | In [JIT mode](#several-models-jit-mode), time without a request before the loaded model is unloaded; `off` or `-1` keeps it loaded until another model is requested. |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |
@@ -122,9 +124,10 @@ the same. Token counts (`--max-context`) are a whole number, or one with a `K`
 suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
 also take `auto`, their default, `--max-cache-disk 0` turns the SSD cache off,
 and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
-(`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
-`m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` turns
-the timer off, and only `POST /v1/memory/release` then frees the weights.
+(`--idle-release`, `--model-ttl`, `--request-timeout`) are seconds, or a number
+with an `s`, `m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release
+off` turns the timer off, and only `POST /v1/memory/release` then frees the
+weights.
 
 ### Network and authentication
 
@@ -351,6 +354,69 @@ and syncs the files. After a crash the next start takes back what reached the
 disk and runs on probation for a minute; if it fails then, the start after it
 begins empty. `/status` reports all this under `disk` (`persistent`,
 `kv_copies`, `taken_back`, `write_behind`).
+
+### Several models (JIT mode)
+
+Repeat `--model`, or add `--all-models`, to serve several models from one
+server. Each request loads the model its `model` field names, and one model is
+loaded at a time:
+
+```sh
+splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
+  --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M
+splash serve --all-models --model-ttl 30m
+```
+
+`--all-models` serves every model installed under its own ID
+(`OWNER/REPO[:VARIANT]`), after any `--model`s; an installation made with
+`--revision`, `--draft-model` or `--language-only` is not one of them. With
+`--all-models` the server runs in JIT mode even when it finds one model.
+
+Startup downloads and verifies every model, then loads each one once to learn
+its context limit, its concurrency and whether it serves vision, and unloads
+it. The first model listed is loaded last and stays loaded, so the first
+request does not wait for a load. A model that fails to load stops startup, as
+it does for one model. Every later load of a model serves the context its
+startup load did.
+
+A request that names no model goes to the loaded model, or else the first
+one. A request for another model waits while the loaded model finishes the
+requests it is serving, takes no new ones meanwhile, unloads it and loads the
+requested one; nothing is cancelled. Models take their turns in the order
+their first waiting request arrived, so two busy models alternate. A request
+still waits for its model within `--request-timeout` and its own `timeout`,
+and a request whose client disconnects stops waiting. If a load fails, the
+requests waiting for that model get 503 `model_unavailable`, and the next
+request for it tries again. Token counting, `/tokenize` and `/apply-template`
+use the model's tokenizer and load nothing.
+
+A loaded model that serves no request for `--model-ttl` (5 minutes by
+default) is unloaded, freeing all of its memory; the server keeps running with
+no model loaded, and `/ready` answers 200 meanwhile. `--model-ttl off` keeps the
+model loaded until a request names another. Within a loaded model,
+`--idle-release` still releases its weights while it idles.
+
+Every option but the ones below applies to each model's engine, or to the
+server as a whole. Options that set one model's source, aliases or limits are
+ignored with a warning: `--revision`, `--draft-model`, `--served-model-name`,
+`--announce-served-name` and `--max-context`. Each model serves its automatic
+context. `--language-only` applies to every model.
+
+The models share one [SSD cache](#ssd-cache) root, `--cache-dir` or the
+default, in which each model keeps its own namespace: one `--max-cache-disk`
+bounds them together, and a loaded model's cache may take the space of the
+others' idle caches. Without `--persistent-cache` a model's SSD cache lasts
+while the model is loaded; with it, a model loaded again resumes from its
+[persistent cache](#persistent-cache).
+
+`/v1/models` lists every model, in the order given, with its own context limit
+and modalities, and `loaded: true` for the loaded one. `/status` reports the
+loaded model's engine, or `engine: "unloaded"` while none is loaded, and adds
+`jit`: the `resident` model, the one `loading`, the `state` (`idle`, `loading`,
+`warm`, `serving`, `draining` or `unloading`), the requests the resident model
+serves (`leases`), the requests `waiting` for each model, `ttl_seconds` (`null`
+for `off`), and each model's `maximum_context_tokens` and `vision` under
+`models`.
 
 ## Model storage
 
@@ -589,7 +655,7 @@ Messages requires it.
 | `GET`, `DELETE /v1/responses/{id}` | A stored response ([Responses state](#responses-state)) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit; in [JIT mode](#several-models-jit-mode), every model, each with its own limit and whether it is loaded |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |

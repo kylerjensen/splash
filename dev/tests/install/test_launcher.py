@@ -2,6 +2,7 @@ import contextlib
 import fcntl
 import io
 import json
+import math
 import os
 import select
 import signal
@@ -87,7 +88,7 @@ class LauncherTests(unittest.TestCase):
             install.assert_not_called()
         for model in MODEL_IDS:
             self.assertEqual(
-                launcher.parse_args(["serve", "--model", model]).model, model
+                launcher.parse_args(["serve", "--model", model]).model, [model]
             )
 
     def test_only_serve_and_clients_are_public(self):
@@ -115,7 +116,7 @@ class LauncherTests(unittest.TestCase):
                 "100K",
             ]
         )
-        self.assertEqual(args.model, MODEL_ID)
+        self.assertEqual(args.model, [MODEL_ID])
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
@@ -1345,6 +1346,217 @@ class LauncherTests(unittest.TestCase):
                 fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
         install.assert_not_called()
         execute.assert_not_called()
+
+
+OTHER_MODEL_ID = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
+
+
+class JitServeTests(unittest.TestCase):
+    """splash serve with several models (JIT mode)."""
+
+    def setUp(self):
+        self.enterContext(mock.patch.dict(os.environ))
+        for name in (
+            "SPLASH_PORT",
+            "SPLASH_API_KEY",
+            "SPLASH_DEFAULT_REASONING_EFFORT",
+        ):
+            os.environ.pop(name, None)
+        keep_stop_signals(self)
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.models = temporary / "models"
+        self.runtime = temporary / "runtime"
+        self.enterContext(mock.patch.object(launcher.paths, "MODELS", self.models))
+        self.enterContext(mock.patch.object(launcher, "RUNTIME_DIR", self.runtime))
+        self.enterContext(mock.patch.object(launcher.socket, "socket"))
+
+    def install(self, model, link=None):
+        """An installed assembly of its own for `model`, at its selection
+        link: `link`, or the model's own without source options."""
+        if link is None:
+            link = launcher.model_artifacts.Selection.of(self.models, model).link
+        assembly = self.models / ".resolved" / link.name.replace(":", "-")
+        assembly.mkdir(parents=True)
+        (assembly / "model.json").write_text("{}")
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(assembly, target_is_directory=True)
+        return assembly
+
+    def serve(self, arguments, lock_checks=None):
+        """Run serve; the installed models, the exec's argv and stderr."""
+        installed = []
+
+        def install(chosen, **options):
+            installed.append((chosen, options))
+            if not chosen.link.is_symlink():
+                self.install(chosen.model, chosen.link)
+
+        def execute(binary, argv, environment):
+            if lock_checks is not None:
+                lock_checks(json.loads((self.runtime / "serve-8000.lock").read_text()))
+
+        with (
+            mock.patch.object(launcher, "_ensure_installed", side_effect=install),
+            mock.patch.object(launcher.os, "execve", side_effect=execute) as exec_,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            status = launcher.main(["serve", *arguments])
+        argv = exec_.call_args.args[1] if exec_.called else None
+        return status, installed, argv, stderr.getvalue()
+
+    def test_repeated_models_prepare_each_and_exec_jit_mode(self):
+        owners = []
+        status, installed, argv, stderr = self.serve(
+            ["--model", MODEL_ID, "--model", OTHER_MODEL_ID, "--model", MODEL_ID],
+            lock_checks=owners.append,
+        )
+        self.assertIsNone(status)
+        self.assertNotIn("applies to one model", stderr)
+        # Each model once, in order; only the first builds and checks the engine.
+        self.assertEqual(
+            [(chosen.model, options) for chosen, options in installed],
+            [(MODEL_ID, {}), (OTHER_MODEL_ID, {"engine": False})],
+        )
+        served = server_arguments(argv)
+        self.assertEqual(
+            served[:6],
+            [
+                "--jit-model",
+                MODEL_ID,
+                str(installed[0][0].link.resolve()),
+                "--jit-model",
+                OTHER_MODEL_ID,
+                str(installed[1][0].link.resolve()),
+            ],
+        )
+        parsed = api.parse_args(served)
+        self.assertEqual(
+            [model for model, _ in parsed.jit_model], [MODEL_ID, OTHER_MODEL_ID]
+        )
+        self.assertIsNone(parsed.model)
+        self.assertEqual(
+            owners,
+            [
+                {
+                    "pid": os.getpid(),
+                    "model": MODEL_ID,
+                    "models": [MODEL_ID, OTHER_MODEL_ID],
+                    "port": 8000,
+                }
+            ],
+        )
+
+    def test_one_model_keeps_the_single_model_command(self):
+        _, _, argv, _ = self.serve(["--model", MODEL_ID])
+        served = server_arguments(argv)
+        self.assertNotIn("--jit-model", served)
+        self.assertEqual(served[3:5], ["--model", MODEL_ID])
+
+    def test_jit_mode_ignores_one_models_options_with_a_warning(self):
+        status, installed, argv, stderr = self.serve(
+            [
+                "--model",
+                MODEL_ID,
+                "--model",
+                OTHER_MODEL_ID,
+                "--revision",
+                "v2",
+                "--served-model-name",
+                "local",
+                "--announce-served-name",
+                "--max-context",
+                "64K",
+                "--max-memory",
+                "28G",
+                "--language-only",
+                "--model-ttl",
+                "off",
+            ]
+        )
+        self.assertIsNone(status)
+        for flag in (
+            "--revision",
+            "--served-model-name",
+            "--announce-served-name",
+            "--max-context",
+        ):
+            self.assertIn(
+                f"Warning: {flag} applies to one model; ignored with several models",
+                stderr,
+            )
+        self.assertNotIn("--max-memory", stderr)
+        # The model's own source options are gone; --language-only applies to
+        # every model.
+        for chosen, _ in installed:
+            self.assertIsNone(chosen.revision)
+            self.assertTrue(chosen.language_only)
+        parsed = api.parse_args(server_arguments(argv))
+        self.assertIsNone(parsed.max_context)
+        self.assertEqual(parsed.served_model_name, [])
+        self.assertEqual(parsed.max_memory, 28 * 1024**3)
+        self.assertEqual(parsed.model_ttl, math.inf)
+
+    def test_all_models_serves_every_installed_assembly(self):
+        self.install("zeta/model")
+        self.install("alpha/model:Q4")
+        # A selection with source options, and a package an older release
+        # installed, are not served.
+        hashed = self.models / ".selections" / ("0" * 64)
+        hashed.parent.mkdir(parents=True)
+        hashed.symlink_to(self.models / ".resolved" / "model")
+        package = self.models / ".resolved" / "package"
+        package.mkdir()
+        (package / "manifest.json").write_text("{}")
+        (self.models / "old").mkdir()
+        (self.models / "old" / "package").symlink_to(package)
+        status, installed, argv, stderr = self.serve(
+            ["--all-models", "--model", MODEL_ID]
+        )
+        self.assertIsNone(status)
+        self.assertEqual(
+            [chosen.model for chosen, _ in installed],
+            [MODEL_ID, "alpha/model:Q4", "zeta/model"],
+        )
+        self.assertIn("old/package is not a model Splash serves; skipped", stderr)
+        self.assertEqual(server_arguments(argv).count("--jit-model"), 3)
+
+    def test_all_models_is_jit_mode_with_one_model_too(self):
+        self.install(MODEL_ID)
+        _, installed, argv, _ = self.serve(["--all-models"])
+        self.assertEqual([chosen.model for chosen, _ in installed], [MODEL_ID])
+        self.assertEqual(server_arguments(argv)[:2], ["--jit-model", MODEL_ID])
+
+    def test_all_models_without_an_installed_model_fails(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(launcher.main(["serve", "--all-models"]), 1)
+        self.assertIn("no installed models to serve", stderr.getvalue())
+
+    def test_serve_needs_a_model_or_all_models(self):
+        with (
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            launcher.parse_args(["serve"])
+        self.assertIn("serve needs --model or --all-models", stderr.getvalue())
+
+    def test_duplicate_serve_names_how_many_models_the_owner_serves(self):
+        self.runtime.mkdir()
+        lock_path = self.runtime / "serve-8000.lock"
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "pid": 1234,
+                    "model": MODEL_ID,
+                    "models": [MODEL_ID, OTHER_MODEL_ID],
+                    "port": 8000,
+                }
+            )
+        )
+        with lock_path.open("a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+        self.assertIn("(PID 1234, 2 models, port 8000)", stderr.getvalue())
 
 
 if __name__ == "__main__":

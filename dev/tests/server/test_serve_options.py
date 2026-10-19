@@ -81,6 +81,11 @@ OPTIONS = {
         {"600": 600.0, "90s": 90.0, "30M": 1800.0, "1.5h": 5400.0, "off": math.inf},
         ("0", "-1m", "inf", "nan", "10x", "m", "never"),
     ),
+    "--model-ttl": values(
+        "--model-ttl",
+        {"300": 300.0, "5m": 300.0, "1h": 3600.0, "off": math.inf, "-1": math.inf},
+        ("0", "-2", "-1m", "inf", "nan", "never"),
+    ),
     "--max-cache-disk": values(
         "--max-cache-disk",
         {"auto": None, "0": 0, "5G": 5 * 1024**3},

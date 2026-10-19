@@ -55,6 +55,8 @@ SERVER_FILES = (
     "json_codec.py",
     "lru.py",
     "latency.py",
+    "jit.py",
+    "residency.py",
     "metrics.py",
     "errors.py",
     "runtime.py",

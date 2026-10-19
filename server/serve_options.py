@@ -202,6 +202,22 @@ def idle_release_text(seconds):
     return "off" if math.isinf(seconds) else str(seconds)
 
 
+# How long a model JIT mode loaded stays resident without a request.
+DEFAULT_MODEL_TTL = 300.0
+
+
+def parse_model_ttl(value):
+    """--model-ttl in seconds, math.inf for off, which -1 also spells."""
+    if value.strip() == "-1":
+        return math.inf
+    try:
+        return parse_idle_release(value)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(
+            "must be off, -1 or a positive duration such as 5m, 1h or 300"
+        ) from None
+
+
 def parse_queue_size(value):
     try:
         size = int(value)
@@ -441,6 +457,19 @@ SERVE_OPTIONS = (
         text=idle_release_text,
     ),
     ServeOption(
+        "--model-ttl",
+        "memory",
+        dict(
+            type=parse_model_ttl,
+            default=DEFAULT_MODEL_TTL,
+            metavar="DURATION",
+            help="with several models, time without a request before the loaded "
+            "one is unloaded: seconds, or with an s, m or h suffix (default: 5m); "
+            "off or -1 keeps it loaded until another model is requested",
+        ),
+        text=idle_release_text,
+    ),
+    ServeOption(
         "--max-cache-disk",
         "cache",
         dict(
@@ -657,6 +686,24 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+
+
+# The shared options that name one model's settings, which serving several
+# models (JIT mode) ignores: an alias names one model, and one context limit
+# does not fit every model's memory, so each serves its automatic context.
+JIT_IGNORED_OPTIONS = ("--served-model-name", "--announce-served-name", "--max-context")
+
+
+def drop_jit_incompatible(args, warn):
+    """Reset the options of JIT_IGNORED_OPTIONS `args` sets to their defaults,
+    calling `warn` with a message for each."""
+    for option in SERVE_OPTIONS:
+        if option.flag not in JIT_IGNORED_OPTIONS:
+            continue
+        default = copy.copy(option.default())
+        if getattr(args, option.dest) != default:
+            warn(f"{option.flag} applies to one model; ignored with several models")
+            setattr(args, option.dest, default)
 
 
 def serve_argv(args):

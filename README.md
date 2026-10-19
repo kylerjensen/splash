@@ -103,6 +103,12 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
+To serve several models from one server, repeat `--model`, or add
+`--all-models` for every installed model. Each request loads the model it
+names, one at a time, and a model idle for `--model-ttl` (default 5m; `off`
+keeps it) is unloaded.
+[Several models](DEVELOPMENT.md#several-models-jit-mode)
+
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
 access, authentication, browser apps on other origins, and other options, see

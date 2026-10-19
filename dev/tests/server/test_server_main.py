@@ -287,5 +287,175 @@ class ServerMainTests(unittest.TestCase):
         self.assertIn("Address already in use", stderr.getvalue())
 
 
+class JitMainTests(unittest.TestCase):
+    """main() serving several models (JIT mode)."""
+
+    MODELS = [("alpha/model", "/models/alpha"), ("beta/model", "/models/beta")]
+
+    def run_main(self, ready, serve=None, args=None):
+        """Run main() with fake engines announcing `ready`, by model root;
+        the runtimes, backends, frontends and server it made."""
+        args = args or main_args(
+            model_root=None, tokenizer=None, model=None, jit_model=self.MODELS
+        )
+        runtimes, backends = [], []
+
+        def runtime(command, **_options):
+            made = mock.Mock(readiness=ready[command[2]])
+            made.command = command
+            made.wait_ready.return_value = True
+            runtimes.append(made)
+            return made
+
+        def backend(made, *_args, **_options):
+            created = mock.Mock(runtime=made)
+            backends.append(created)
+            return created
+
+        server = mock.Mock(server_port=8000)
+        server.serve_forever.side_effect = (
+            KeyboardInterrupt if serve is None else lambda: serve(server)
+        )
+        with (
+            mock.patch.object(api, "parse_args", return_value=args),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", side_effect=lambda path, **_: path
+            ) as tokenizers,
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "thinking_end_tokens"),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", side_effect=runtime
+            ),
+            mock.patch.object(api, "NativeBackend", side_effect=backend),
+            mock.patch.object(api, "Frontend") as frontends,
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            try:
+                api.main()
+            except SystemExit as exit_:
+                self.exit_code = exit_.code
+        self.tokenizer_paths = [call.args[0] for call in tokenizers.call_args_list]
+        self.stdout = stdout.getvalue()
+        return runtimes, backends, frontends, server
+
+    def test_startup_probes_every_model_and_keeps_the_first_loaded(self):
+        ready = {
+            "/models/alpha": native_wire.ReadyEvent(4, 131072, True),
+            "/models/beta": native_wire.ReadyEvent(4, 65536, False),
+        }
+        seen = {}
+
+        def serve(server):
+            seen["app"] = server.app
+            raise KeyboardInterrupt
+
+        runtimes, backends, frontends, server = self.run_main(ready, serve)
+        self.assertEqual(
+            self.tokenizer_paths, ["/models/alpha/tokenizer", "/models/beta/tokenizer"]
+        )
+        # The second model is probed first and stopped; the first, the
+        # default, is probed last and stays loaded until the server stops.
+        self.assertEqual(
+            [made.command[2] for made in runtimes], ["/models/beta", "/models/alpha"]
+        )
+        for made in runtimes:
+            self.assertEqual(made.command[3], "auto")
+            self.assertNotIn("--relaunch-context", made.command)
+        beta, alpha = backends
+        beta.close.assert_called_once_with()
+        alpha.close.assert_called_once_with()
+        router = seen["app"]
+        self.assertIsInstance(router, api.ModelRouter)
+        self.assertEqual(router.model_names, ("alpha/model", "beta/model"))
+        # Each frontend has its model's context, concurrency and vision.
+        self.assertEqual(
+            [
+                (call.args[2], call.args[3], call.args[5], call.kwargs["vision"])
+                for call in frontends.call_args_list
+            ],
+            [("alpha/model", 131072, 4, True), ("beta/model", 65536, 4, False)],
+        )
+        self.assertEqual(
+            [type(call.args[1]) for call in frontends.call_args_list],
+            [api.ModelSlot, api.ModelSlot],
+        )
+        server.server_activate.assert_called_once_with()
+        self.assertIn("Model · beta/model · context 64K · language only", self.stdout)
+        self.assertIn("Ready · 2 models · alpha/model loaded · TTL 5m", self.stdout)
+
+    def test_a_later_load_serves_the_context_its_probe_did(self):
+        ready = {
+            "/models/alpha": native_wire.ReadyEvent(4, 131072, True),
+            "/models/beta": native_wire.ReadyEvent(4, 65536, False),
+        }
+        loaded = {}
+
+        def serve(server):
+            lease = server.app.residency.lease("beta/model")
+            loaded["engine"] = lease.engine
+            lease.release()
+            raise KeyboardInterrupt
+
+        runtimes, backends, _, server = self.run_main(ready, serve)
+        later = runtimes[-1]
+        self.assertEqual(later.command[2], "/models/beta")
+        self.assertEqual(later.command[-2:], ["--relaunch-context", "65536"])
+        self.assertIs(loaded["engine"], backends[-1])
+        # The default model unloaded to make room.
+        backends[1].close.assert_called_once_with()
+
+    def test_a_model_that_fails_its_probe_stops_startup(self):
+        ready = {
+            "/models/alpha": native_wire.ReadyEvent(4, 131072, True),
+            "/models/beta": None,
+        }
+        runtimes, backends, _, server = self.run_main(ready)
+        self.assertEqual(self.exit_code, 1)
+        self.assertEqual(len(runtimes), 1)
+        backends[0].close.assert_called()
+        server.server_activate.assert_not_called()
+        server.server_close.assert_called_once_with()
+
+    def test_parse_args_takes_jit_models_and_ignores_one_models_options(self):
+        args = [
+            "--jit-model",
+            "alpha/model",
+            "/models/alpha",
+            "--jit-model",
+            "beta/model:Q4",
+            "/models/beta",
+            "--max-context",
+            "64K",
+            "--model-ttl",
+            "off",
+        ]
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            parsed = api.parse_args(args)
+        self.assertEqual(
+            parsed.jit_model,
+            [("alpha/model", "/models/alpha"), ("beta/model:Q4", "/models/beta")],
+        )
+        self.assertIsNone(parsed.max_context)
+        self.assertEqual(parsed.model_ttl, math.inf)
+        self.assertIn("--max-context applies to one model", stderr.getvalue())
+        for refused in (
+            [*args[:3], "--jit-model", "alpha/model", "/models/other"],
+            [*args[:3], "--jit-model", "not a model", "/models/other"],
+            [*args[:3], "model", "--tokenizer", "tokenizer", "--model", "a/b"],
+            [],
+        ):
+            with (
+                self.subTest(arguments=refused),
+                mock.patch("sys.stderr", new_callable=io.StringIO),
+                self.assertRaises(SystemExit),
+            ):
+                api.parse_args(refused)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ from urllib.parse import unquote
 from transformers import AutoTokenizer
 
 from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import json_codec, judgments, residency, serve_options
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -64,14 +64,15 @@ from .errors import (
     RequestValidationError,
     field_error,
 )
-from .frontend import Frontend
+from .frontend import Frontend, ResponseStore
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
     authenticate,
     validate_headers,
 )
-from .latency import RequestLatency
+from .jit import ModelEntry, ModelRouter, ModelSlot, context_text
+from .latency import LatencyMetrics, RequestLatency
 from .metrics import prometheus_metrics, timings_dict, usage_dict
 from .origins import ANY_ORIGIN
 from .output import (
@@ -364,7 +365,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     @property
     def app(self):
-        return self.server.app
+        # In JIT mode, the frontend of the model the request names, once its
+        # body is read.
+        app = getattr(self, "_app", None)
+        return self.server.app if app is None else app
 
     @property
     def route(self):
@@ -578,6 +582,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._json(200, stored.response)
             return
         if path == "/v1/models" or path.startswith("/v1/models/"):
+            if isinstance(self.app, ModelRouter):
+                self._models(path, self.app.models())
+                return
             models = [
                 {
                     "id": name,
@@ -596,28 +603,32 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 }
                 for name in self.app.model_names
             ]
-            if path == "/v1/models":
-                # TypeSafe SDK compatibility: models.list() reads "models" entries.
-                typed = [
-                    {
-                        "name": item["id"],
-                        "description": "Splash resident model",
-                        "release_date": "",
-                    }
-                    for item in models
-                ]
-                self._json(200, {"object": "list", "data": models, "models": typed})
-            else:
-                name = path.removeprefix("/v1/models/")
-                model = next((item for item in models if item["id"] == name), None)
-                if model is None:
-                    self._safe_error(
-                        APIError(404, "model not found", "model_not_found")
-                    )
-                else:
-                    self._json(200, model)
+            self._models(path, models)
             return
         self._safe_error(APIError(404, "not found", "not_found"))
+
+    def _models(self, path, models):
+        """Answer /v1/models, or /v1/models/{id}, from `models`' entries; an
+        entry's description goes to the TypeSafe listing alone."""
+        descriptions = [item.pop("description", None) for item in models]
+        if path == "/v1/models":
+            # TypeSafe SDK compatibility: models.list() reads "models" entries.
+            typed = [
+                {
+                    "name": item["id"],
+                    "description": description or "Splash resident model",
+                    "release_date": "",
+                }
+                for item, description in zip(models, descriptions, strict=True)
+            ]
+            self._json(200, {"object": "list", "data": models, "models": typed})
+        else:
+            name = path.removeprefix("/v1/models/")
+            model = next((item for item in models if item["id"] == name), None)
+            if model is None:
+                self._safe_error(APIError(404, "model not found", "model_not_found"))
+            else:
+                self._json(200, model)
 
     def do_DELETE(self):
         path = self.route
@@ -662,6 +673,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._body_reservation = None
         # The native job submitted last, which a failure cancels.
         self._submitted = None
+        self._app = None
+        # In JIT mode, the request's hold on its resident model.
+        self._lease = None
         try:
             generation = self._serve(route, started_at)
             if generation is not None:
@@ -690,8 +704,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # still reads of an upload refused unread; the job must not, as
             # freeing it returns the input it retains.
             self._submitted = None
+            if self._lease is not None:
+                self._lease.release()
+                self._lease = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
+            self._app = None
 
     def _serve(self, route, started_at):
         """Read the request and serve it: answer it, or prepare the
@@ -708,7 +726,36 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
         serve = getattr(self, route.method)
+        if isinstance(self.server.app, ModelRouter):
+            return self._serve_jit(route, serve, body, started_at)
         return serve(body, self.app.request_deadline(body, started_at))
+
+    def _serve_jit(self, route, serve, body, started_at):
+        """Serve the request with the frontend of the model it names, once a
+        generation's model is resident. A name no model has goes to the
+        default model's frontend, which refuses it as the endpoint's API
+        does."""
+        router = self.server.app
+        entry = router.select(body.get("model"))
+        self._app = (router.default if entry is None else entry).frontend
+        deadline = self.app.request_deadline(body, started_at)
+        if entry is not None and not route.prompt_only and not route.fieldless:
+            try:
+                self._lease = router.residency.lease(
+                    entry.model, deadline, self._client_disconnected
+                )
+            except residency.LeaseTimeout:
+                raise APIError(504, "request timed out", "request_timeout") from None
+            except residency.ModelLoadFailed as error:
+                raise APIError(503, str(error), "model_unavailable") from None
+            except residency.ResidencyClosed:
+                raise APIError(
+                    503, "server is shutting down", "server_shutdown"
+                ) from None
+            refusal = self.app.backend.refusal()
+            if refusal is not None:
+                raise refusal
+        return serve(body, deadline)
 
     def _generate(self, job, respond, started_at):
         """Submit a prepared generation and answer with its output. The
@@ -1630,34 +1677,64 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model_root",
+        nargs="?",
         metavar="MODEL_DIRECTORY",
         help="installed model directory holding target/ and draft/",
     )
-    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--tokenizer")
     parser.add_argument(
         "--model",
         type=serve_options.parse_model_id,
-        required=True,
         metavar="OWNER/REPO",
+    )
+    parser.add_argument(
+        "--jit-model",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("OWNER/REPO", "MODEL_DIRECTORY"),
+        help="a model to serve in JIT mode, loaded when a request names it, "
+        "with its installed directory, whose tokenizer/ it reads (repeatable; "
+        "replaces MODEL_DIRECTORY, --tokenizer and --model)",
     )
     parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
+    if args.jit_model:
+        if args.model_root or args.tokenizer or args.model:
+            parser.error(
+                "--jit-model replaces MODEL_DIRECTORY, --tokenizer and --model"
+            )
+        models = []
+        for model, root in args.jit_model:
+            try:
+                models.append((serve_options.parse_model_id(model), root))
+            except argparse.ArgumentTypeError as error:
+                parser.error(f"--jit-model {model}: {error}")
+        if len({model for model, _ in models}) != len(models):
+            parser.error("--jit-model names a model twice")
+        args.jit_model = models
+        serve_options.drop_jit_incompatible(
+            args, lambda message: print_status(f"Warning · {message}", error=True)
+        )
+    elif not (args.model_root and args.tokenizer and args.model):
+        parser.error("MODEL_DIRECTORY, --tokenizer and --model are required")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
 
 
-def _native_command(args, relaunch_context=None):
+def _native_command(args, relaunch_context=None, model_root=None):
     """The engine's command line, a relaunch's with `relaunch_context`, the
     context the first engine served: without --max-context the relaunch keeps
-    it, where its own would follow a Neural Engine split calibrated anew."""
+    it, where its own would follow a Neural Engine split calibrated anew. It
+    serves `model_root`, by default the one model's directory."""
     command = [
         args.binary,
         "serve-native",
-        args.model_root,
+        args.model_root if model_root is None else str(model_root),
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
@@ -1707,11 +1784,186 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _valid_readiness(readiness):
+    return (
+        readiness is not None
+        and 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
+    )
+
+
+def _model_entry(args, model, root):
+    """A model JIT mode serves, with what serving it needs read from its
+    directory: an unreadable tokenizer or chat template stops startup."""
+    root = Path(root)
+    print_status(f"Loading · {model}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(root / "tokenizer"), local_files_only=True, trust_remote_code=False
+    )
+    validate_tokenizer(tokenizer)
+    chat_templates = ChatTemplates(tokenizer)
+    print_status(f"Chat template · {model} · {chat_templates.describe()}")
+    return ModelEntry(
+        model,
+        root,
+        tokenizer=tokenizer,
+        chat_templates=chat_templates,
+        constraint_factory=ConstraintFactory(tokenizer),
+        thinking_end=thinking_end_tokens(tokenizer, args.thinking_end_text),
+    )
+
+
+def _load_engine(args, entry, started):
+    """Start the engine of `entry` and return its backend once it is Ready.
+    The first start, startup's probe, serves the automatic context; every
+    later one the context the probe served, and must announce what the probe
+    did. `started` receives the backend at once, so a stop during the wait
+    can close it."""
+    probed = entry.readiness
+    runtime = engine_runtime.MultiplexedRuntime(
+        _native_command(
+            args, None if probed is None else probed.max_context_tokens, entry.root
+        ),
+        relaunch_command=lambda first: _native_command(
+            args, first.max_context_tokens, entry.root
+        ),
+        startup_timeout=NATIVE_START_TIMEOUT,
+        pending_limit=args.queue_size,
+    )
+    backend = NativeBackend(
+        runtime,
+        entry.tokenizer,
+        request_logger=print_request,
+        thinking_end=entry.thinking_end,
+    )
+    started(backend)
+    try:
+        if not runtime.wait_ready():
+            raise engine_runtime.EngineUnhealthy(
+                f"native runtime of {entry.model} did not become ready"
+            )
+        readiness = runtime.readiness
+        if not _valid_readiness(readiness):
+            raise engine_runtime.EngineUnhealthy(
+                f"native runtime of {entry.model} reported an invalid context window"
+            )
+        if probed is not None and readiness != probed:
+            raise engine_runtime.EngineUnhealthy(
+                f"native runtime of {entry.model} announced other limits than at "
+                "startup"
+            )
+    except BaseException:
+        backend.close()
+        raise
+    return backend
+
+
+def _duration_text(seconds):
+    """A duration as the startup summary shows it: 5m, 1h, 90s or off."""
+    if math.isinf(seconds):
+        return "off"
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return f"{seconds / size:g}{unit}"
+    return f"{seconds:g}s"
+
+
+def _serve_models(args, server, thinking_codec, resources):
+    """Serve several models from this process (JIT mode) until a stop. Every
+    model's engine starts once, its probe, which tells its context; the
+    first model's, probed last, stays loaded. `resources` holds what the
+    caller's cleanup stops: the residency, the router, and an engine being
+    started."""
+    entries = {model: _model_entry(args, model, root) for model, root in args.jit_model}
+
+    def started(backend):
+        resources["starting"] = backend
+
+    def load(model):
+        print_status(f"Loading · {model}")
+        backend = _load_engine(args, entries[model], started)
+        resources["starting"] = None
+        print_status(f"Loaded · {model}")
+        return backend
+
+    def unload(model, backend):
+        print_status(f"Unloading · {model}")
+        backend.close()
+
+    models = residency.Residency(load, unload, args.model_ttl)
+    resources["residency"] = models
+    default, *others = entries.values()
+    for entry in (*others, default):
+        print_status(f"Probing · {entry.model}")
+        backend = _load_engine(args, entry, started)
+        entry.readiness = backend.runtime.readiness
+        if entry is default:
+            models.adopt(entry.model, backend)
+        else:
+            backend.close()
+        resources["starting"] = None
+    timeout = math.inf if args.request_timeout is None else args.request_timeout
+    latencies = LatencyMetrics()
+    responses = ResponseStore()
+    for entry in entries.values():
+        entry.frontend = Frontend(
+            entry.tokenizer,
+            ModelSlot(models, entry.model),
+            entry.model,
+            entry.readiness.max_context_tokens,
+            timeout,
+            entry.readiness.max_concurrent_requests,
+            constraint_factory=entry.constraint_factory,
+            chat_templates=entry.chat_templates,
+            max_image_pixels=args.max_image_pixels,
+            thinking_codec=thinking_codec,
+            default_reasoning_effort=args.default_reasoning_effort,
+            default_thinking_token_budget=args.thinking_token_budget,
+            vision=entry.readiness.vision,
+            latencies=latencies,
+            response_store=responses,
+        )
+    router = ModelRouter(
+        list(entries.values()),
+        models,
+        latencies=latencies,
+        response_store=responses,
+        request_timeout=timeout,
+    )
+    resources["router"] = router
+    server.app = router
+    server.server_activate()
+    address = f"http://{args.host}:{server.server_port}"
+    for entry in entries.values():
+        mode = "" if entry.readiness.vision else " · language only"
+        print_status(
+            f"Model · {entry.model} · context "
+            f"{context_text(entry.readiness.max_context_tokens)}{mode}"
+        )
+    ttl = _duration_text(args.model_ttl)
+    print_status(
+        f"Ready · {len(entries)} models · {default.model} loaded · TTL {ttl} · "
+        f"{address}"
+    )
+    server.serve_forever()
+
+
+def _kill_engines(resources):
+    """SIGKILL the engines JIT mode runs, without waiting for their exit."""
+    backends = [resources.get("starting")]
+    if (models := resources.get("residency")) is not None:
+        backends.append(models.held_engine)
+    for backend in backends:
+        if backend is not None:
+            backend.runtime.kill()
+
+
 def main():
     args = parse_args()
     server = None
     runtime = None
     backend = None
+    # JIT mode's: see _serve_models.
+    resources = {}
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1744,6 +1996,9 @@ def main():
                 error=True,
             )
         thinking_codec = ThinkingCodec(load_thinking_key())
+        if args.jit_model:
+            _serve_models(args, server, thinking_codec, resources)
+            return
         print_status(f"Loading · {args.model}")
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer, local_files_only=True, trust_remote_code=False
@@ -1804,11 +2059,7 @@ def main():
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
-        )
+        context = context_text(effective_context)
         mode = "" if readiness.vision else " · language only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
@@ -1831,14 +2082,25 @@ def main():
         # returns, except that a second Ctrl+C during cleanup stops the engine
         # without waiting for its graceful exit.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(
-            signal.SIGINT,
-            signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
-        )
+        if resources:
+            signal.signal(signal.SIGINT, lambda *_: _kill_engines(resources))
+        else:
+            signal.signal(
+                signal.SIGINT,
+                signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
+            )
         try:
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
+            if resources:
+                print_status("Stopping · releasing engine resources")
+                if (router := resources.get("router")) is not None:
+                    router.backend.closing = True
+                if (starting := resources.get("starting")) is not None:
+                    starting.close()
+                if (models := resources.get("residency")) is not None:
+                    models.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:

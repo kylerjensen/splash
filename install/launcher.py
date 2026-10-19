@@ -97,7 +97,33 @@ def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
         return None
 
 
-def _ensure_installed(selection):
+def _ensure_installed(selection, *, engine=True):
+    """Prepare `selection`; with `engine`, first build a source checkout and
+    check this Mac, which serving several models does once."""
+    if engine:
+        _ensure_engine()
+    command = [
+        str(paths.PYTHON),
+        str(ROOT / "install/models.py"),
+        "--models",
+        str(selection.models_root),
+        "--model",
+        selection.model,
+        "prepare",
+    ]
+    for flag, value in (
+        ("--revision", selection.revision),
+        ("--draft-model", selection.draft_model),
+    ):
+        if value is not None:
+            command[-1:-1] = [flag, value]
+    if selection.language_only:
+        command.insert(-1, "--language-only")
+    if _run_held(command, cwd=ROOT):
+        raise LauncherError("model download or verification failed")
+
+
+def _ensure_engine():
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -120,25 +146,6 @@ def _ensure_installed(selection):
         model_artifacts.run_engine(["device-check"], "device check")
     except model_artifacts.ModelError as error:
         raise LauncherError(str(error)) from None
-    command = [
-        str(paths.PYTHON),
-        str(ROOT / "install/models.py"),
-        "--models",
-        str(selection.models_root),
-        "--model",
-        selection.model,
-        "prepare",
-    ]
-    for flag, value in (
-        ("--revision", selection.revision),
-        ("--draft-model", selection.draft_model),
-    ):
-        if value is not None:
-            command[-1:-1] = [flag, value]
-    if selection.language_only:
-        command.insert(-1, "--language-only")
-    if _run_held(command, cwd=ROOT):
-        raise LauncherError("model download or verification failed")
 
 
 def _serve_lock_owner(lock):
@@ -160,7 +167,64 @@ def _serve_lock_owner(lock):
         or not 1 <= port <= 65535
     ):
         return ""
+    models = owner.get("models")
+    if (
+        isinstance(models, list)
+        and len(models) > 1
+        and all(isinstance(name, str) for name in models)
+    ):
+        return f" (PID {pid}, {len(models)} models, port {port})"
     return f" (PID {pid}, model {model}, port {port})"
+
+
+def _installed_models(models_root):
+    """The model IDs of the installed assemblies --all-models serves, sorted:
+    each OWNER/REPO[:VARIANT] selection link. A selection with source options
+    (.selections) is left out, as its options are not recoverable from it."""
+    found = []
+    for link in model_artifacts.selection_links(models_root):
+        if link.parent.name.startswith("."):
+            continue
+        model = f"{link.parent.name}/{link.name}"
+        try:
+            serve_options.parse_model_id(model)
+        except argparse.ArgumentTypeError:
+            continue
+        kind = model_artifacts.installation_kind(link)
+        if kind != model_artifacts.ASSEMBLY:
+            if kind is not None:
+                model_artifacts.warn(f"{model} is not a model Splash serves; skipped")
+            continue
+        found.append(model)
+    return sorted(found)
+
+
+def _served_models(args):
+    """The models `serve` serves, in order, without repeats: each --model, then
+    with --all-models every installed one."""
+    models = list(args.model or ())
+    if args.all_models:
+        models.extend(_installed_models(paths.MODELS))
+    models = list(dict.fromkeys(models))
+    if not models:
+        raise LauncherError(
+            "no installed models to serve; install one with "
+            "'splash serve --model <HF_REPO_ID>' first"
+        )
+    return models
+
+
+def _drop_jit_incompatible(args):
+    """Ignore, with a warning each, the options that name one model's
+    settings, when serving several (JIT mode)."""
+    for flag in ("--revision", "--draft-model"):
+        dest = flag.removeprefix("--").replace("-", "_")
+        if getattr(args, dest) is not None:
+            model_artifacts.warn(
+                f"{flag} applies to one model; ignored with several models"
+            )
+            setattr(args, dest, None)
+    serve_options.drop_jit_incompatible(args, model_artifacts.warn)
 
 
 def _check_port(host, port):
@@ -214,9 +278,16 @@ def serve(args):
                 f"Splash is already serving{_serve_lock_owner(lock)}; "
                 "stop it with Ctrl+C first"
             ) from None
+        models = _served_models(args)
+        jit = len(models) > 1 or args.all_models
+        if jit:
+            _drop_jit_incompatible(args)
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
+        owner = {"pid": os.getpid(), "model": models[0], "port": args.port}
+        if jit:
+            owner["models"] = models
+        json.dump(owner, lock)
         lock.flush()
         # Fail before downloads/builds if another service owns the selected port.
         # The HTTP server also binds before loading weights, closing the race.
@@ -226,19 +297,41 @@ def serve(args):
             raise LauncherError(
                 f"cannot bind {args.host}:{args.port}: {error}"
             ) from None
-        selection = model_artifacts.Selection.of(
-            paths.MODELS,
-            args.model,
-            revision=args.revision,
-            language_only=args.language_only,
-            draft_model=args.draft_model,
-        )
-        _ensure_installed(selection)
-        # A concurrent install may advance the selection link. Keep this
-        # process's tokenizer, draft and target on one immutable assembly,
-        # held until the server exits.
-        root, record = assembly.hold(selection.link, selection.models_root)
-        os.set_inheritable(record.fileno(), True)
+        # Every model is prepared before the server starts, so no request
+        # waits for a download.
+        roots = []
+        for index, model in enumerate(models):
+            selection = model_artifacts.Selection.of(
+                paths.MODELS,
+                model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
+            )
+            if index:
+                _ensure_installed(selection, engine=False)
+            else:
+                _ensure_installed(selection)
+            # A concurrent install may advance the selection link. Keep this
+            # process's tokenizer, draft and target on one immutable
+            # assembly, held until the server exits.
+            root, record = assembly.hold(selection.link, selection.models_root)
+            os.set_inheritable(record.fileno(), True)
+            roots.append(root)
+        if jit:
+            selected = [
+                argument
+                for model, root in zip(models, roots, strict=True)
+                for argument in ("--jit-model", model, str(root))
+            ]
+        else:
+            selected = [
+                str(roots[0]),
+                "--tokenizer",
+                str(roots[0] / "tokenizer"),
+                "--model",
+                models[0],
+            ]
         # The server package of this installation, from any working
         # directory: -P keeps the directory, which may hold a package of the
         # same name, off sys.path, and PYTHONPATH names the root.
@@ -248,11 +341,7 @@ def serve(args):
             "-P",
             "-m",
             "server.server",
-            str(root),
-            "--tokenizer",
-            str(root / "tokenizer"),
-            "--model",
-            args.model,
+            *selected,
             "--binary",
             str(paths.BINARY),
             "--port",
@@ -383,7 +472,9 @@ def parse_args(argv=None):
         epilog=(
             "Examples:\n"
             "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M\n"
-            "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n\n"
+            "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n"
+            "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \\\n"
+            "      --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M  # JIT: one loaded at a time\n\n"
             "SIZE is bytes, or a number with K, M or G (1024-based), such as 28G.\n"
             "DURATION is seconds, or a number with s, m or h, such as 30m.\n\n"
             "After Ready, open http://127.0.0.1:PORT in a browser on this Mac, or\n"
@@ -400,9 +491,16 @@ def parse_args(argv=None):
     model.add_argument(
         "--model",
         type=serve_options.parse_model_id,
-        required=True,
+        action="append",
         metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. "
+        ":UD-Q4_K_M); repeat it to serve several, loading the one each request "
+        "names (JIT mode)",
+    )
+    model.add_argument(
+        "--all-models",
+        action="store_true",
+        help="also serve every installed model, in JIT mode",
     )
     model.add_argument(
         "--revision",
@@ -462,6 +560,8 @@ def parse_args(argv=None):
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
+        if not args.model and not args.all_models:
+            parser.error("serve needs --model or --all-models")
         serve_options.check_serve_arguments(parser, args)
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
