@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests import agent_real as agent
@@ -272,8 +273,9 @@ class AgentRunnerTests(unittest.TestCase):
 
     def test_real_harnesses_accept_exactly_the_ids_splash_serve_accepts(self):
         parsers = {
-            "splash serve": lambda model: agent.launcher.parse_args(
-                ["serve", "--model", model]
+            # serve's --model is repeatable: its one model.
+            "splash serve": lambda model: SimpleNamespace(
+                model=agent.launcher.parse_args(["serve", "--model", model]).model[0]
             ),
             "agent_real": lambda model: agent.parse_args(["--model", model]),
             "smoke_real": lambda model: agent.smoke_real.parse_args(["--model", model]),
